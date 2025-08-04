@@ -1,0 +1,452 @@
+//@version=5
+indicator("Billy's Golden Dead Cross", overlay=true, max_boxes_count=500)
+
+// 表示設定
+show_ma_lines = input.bool(true, "移動平均線を表示", group="表示設定")
+show_tp_lines = input.bool(true, "TPラインを表示", group="表示設定")
+show_tp_labels = input.bool(true, "TPラベルを表示", group="表示設定")
+show_cross_markers = input.bool(true, "クロスマーカーを表示", group="表示設定")
+
+// 共通設定
+pip_multiplier = input.float(10, "Pip計算倍率（XAU=1, JPY=10, USD=1000）", group="共通設定")
+
+// TP設定
+enable_tp = input.bool(true, "TPを有効化", group="TP設定")
+tp_pips = input.float(1800.0, "TP (Pips)", minval=0, step=10, group="TP設定")
+
+// エントリーフィルター設定
+enable_deviation_filter = input.bool(true, "乖離フィルターを有効化", group="エントリーフィルター")
+deviation_threshold = input.float(300.0, "乖離閾値 (pips)", minval=0, step=50, group="エントリーフィルター")
+
+// 統計設定
+show_stats = input.bool(true, "統計情報を表示", group="統計設定")
+stats_position = input.string("top_right", "統計テーブルの位置", options=["top_left", "top_center", "top_right", "middle_left", "middle_center", "middle_right", "bottom_left", "bottom_center", "bottom_right"], group="統計設定")
+stats_start_date = input.time(timestamp("2025-04-09 11:00 +0900"), "集計開始日時 (UTC+9)", group="統計設定")
+stats_end_date = input.time(timestamp("2025-06-09 23:59 +0900"), "集計終了日時 (UTC+9)", group="統計設定")
+
+// MA設定
+fast_type = input.string("HMA", "短期MA計算タイプ", options=["SMA", "EMA", "HMA"], group="MA設定")
+fast_period = input.int(9, "短期MA期間", minval=1, group="MA設定")
+fast_color = input.color(color.rgb(220, 220, 220), "短期MA色", group="MA設定")  // 白に近いグレー
+slow_type = input.string("SMA", "長期MA計算タイプ", options=["SMA", "EMA", "HMA"], group="MA設定")
+slow_period = input.int(27, "長期MA期間", minval=1, group="MA設定")
+slow_color = input.color(color.rgb(0, 150, 200), "長期MA色", group="MA設定")    // マリンブルー
+
+// デバッグ用の表示
+show_debug = input.bool(false, "デバッグ情報を表示", group="デバッグ")
+debug_position = input.string("bottom_right", "デバッグテーブルの位置", options=["top_left", "top_center", "top_right", "middle_left", "middle_center", "middle_right", "bottom_left", "bottom_center", "bottom_right"], group="デバッグ")
+
+// 文字列を位置に変換する関数
+get_table_position(pos_str) =>
+    switch pos_str
+        "top_left" => position.top_left
+        "top_center" => position.top_center
+        "top_right" => position.top_right
+        "middle_left" => position.middle_left
+        "middle_center" => position.middle_center
+        "middle_right" => position.middle_right
+        "bottom_left" => position.bottom_left
+        "bottom_center" => position.bottom_center
+        "bottom_right" => position.bottom_right
+        => position.top_right
+
+// HMA計算用関数
+hma(source, length) =>
+    wma_1 = ta.wma(source, length / 2)
+    wma_2 = ta.wma(source, length)
+    sqrt_length = math.round(math.sqrt(length))
+    ta.wma(2 * wma_1 - wma_2, sqrt_length)
+
+// 移動平均計算関数
+calculate_ma(ma_type, src, len) =>
+    result = ma_type == "SMA" ? ta.sma(src, len) : 
+             ma_type == "EMA" ? ta.ema(src, len) : 
+             hma(src, len)
+    result
+
+// 移動平均の計算
+fast_ma = calculate_ma(fast_type, close, fast_period)
+slow_ma = calculate_ma(slow_type, close, slow_period)
+
+// クロスの検出（確定足ベース：1本前で確定）
+golden_cross = ta.crossover(fast_ma[1], slow_ma[1])
+dead_cross = ta.crossunder(fast_ma[1], slow_ma[1])
+
+// 最新のクロス情報を保存（varを使用して値を保持）
+var float last_dc_price = na
+var int last_dc_bar = na
+var float last_gc_price = na
+var int last_gc_bar = na
+var int last_dc_time = na
+var int last_gc_time = na
+
+// 現在のポジション状態を保存（1: ロング、-1: ショート、0: ノーポジション）
+var int current_position = 0
+
+// エントリー見送りフラグ
+var bool skip_gc_entry = false
+var bool skip_dc_entry = false
+
+// TP価格を保存
+var float current_tp_price = na
+var line tp_line = na
+var label tp_label = na
+
+// TPヒット判定用
+var bool tp_hit = false
+var float exit_price = na
+var int exit_bar = na
+var int exit_time = na
+
+// 統計用変数
+var float total_green_pips = 0.0
+var float total_red_pips = 0.0
+var float total_purple_pips = 0.0
+var int green_count = 0
+var int red_count = 0
+var int purple_count = 0
+var int skip_count = 0  // 乖離フィルターによる見送り回数
+
+// クロス時の正確な価格を計算する関数
+get_cross_price(ma1_prev, ma1_curr, ma2_prev, ma2_curr) =>
+    // 2つの移動平均線の交点を線形補間で計算
+    if (ma1_prev - ma2_prev) != 0
+        t = (ma2_prev - ma1_prev) / ((ma1_curr - ma1_prev) - (ma2_curr - ma2_prev))
+        cross_price = ma1_prev + t * (ma1_curr - ma1_prev)
+        cross_price
+    else
+        (ma1_curr + ma2_curr) / 2
+
+// TPヒットチェック（関数外で直接実行）
+if enable_tp and current_position != 0
+    // ロングポジションの場合
+    if current_position == 1
+        if not na(current_tp_price) and high >= current_tp_price and not tp_hit
+            tp_hit := true
+            exit_price := current_tp_price
+            exit_bar := bar_index
+            exit_time := time
+            // TPラインとラベルを削除
+            if not na(tp_line)
+                line.delete(tp_line)
+            if not na(tp_label)
+                label.delete(tp_label)
+            tp_line := na
+            tp_label := na
+    // ショートポジションの場合
+    else if current_position == -1
+        if not na(current_tp_price) and low <= current_tp_price and not tp_hit
+            tp_hit := true
+            exit_price := current_tp_price
+            exit_bar := bar_index
+            exit_time := time
+            // TPラインとラベルを削除
+            if not na(tp_line)
+                line.delete(tp_line)
+            if not na(tp_label)
+                label.delete(tp_label)
+            tp_line := na
+            tp_label := na
+
+// ゴールデンクロス時の処理
+if golden_cross
+    entry_price = open
+    
+    // クロス時の正確な価格を計算
+    cross_price = get_cross_price(fast_ma[2], fast_ma[1], slow_ma[2], slow_ma[1])
+    
+    // 乖離を計算（GC時: エントリー価格 - クロス価格）
+    deviation_pips = (entry_price - cross_price) * pip_multiplier
+    
+    // エントリー見送り判定（GC時はプラスの乖離をチェック）
+    skip_entry = enable_deviation_filter and deviation_pips > deviation_threshold
+    
+    if skip_entry
+        skip_gc_entry := true
+        // 見送りマーカーを表示
+        label.new(bar_index, low, "Skip\n" + str.tostring(deviation_pips, "#.0") + "p", 
+                 style=label.style_label_up, color=color.orange, textcolor=color.white, size=size.tiny)
+        // 統計期間内なら見送り回数をカウント
+        if time >= stats_start_date and time <= stats_end_date
+            skip_count += 1
+    else
+        skip_gc_entry := false
+        
+        // 前のDCが存在する場合、DC→GCのボックスを描画
+        if not na(last_dc_price) and not na(last_dc_bar) and not skip_dc_entry
+            // 統計期間内かチェック
+            bool is_in_stats_period = last_dc_time >= stats_start_date and time <= stats_end_date
+            
+            // TPヒットした場合は、エントリーからTPまでのボックスを描画
+            if tp_hit
+                // TPヒット時は常にブルーパープル
+                box.new(last_dc_bar, math.max(last_dc_price, exit_price), exit_bar, math.min(last_dc_price, exit_price), 
+                       bgcolor=color.new(#6366F1, 85), border_color=color.new(#6366F1, 40), border_width=1)
+                
+                // 統計集計（パープル）
+                if is_in_stats_period and show_stats
+                    box_height_pips = math.abs(exit_price - last_dc_price) * pip_multiplier
+                    total_purple_pips += box_height_pips
+                    purple_count += 1
+            else
+                // 通常のクロス（TPヒットなし）の場合、現在の価格で計算
+                price_diff = entry_price - last_dc_price
+                // マイナスの差分ならブルー、プラスの差分ならレッド
+                box_color = price_diff < 0 ? color.blue : color.red
+                
+                // ボックスを作成
+                box.new(last_dc_bar, math.max(last_dc_price, entry_price), bar_index, math.min(last_dc_price, entry_price), 
+                       bgcolor=color.new(box_color, 85), border_color=color.new(box_color, 40), border_width=1)
+                
+                // 統計集計（ブルーまたはレッド）
+                if is_in_stats_period and show_stats
+                    box_height_pips = math.abs(entry_price - last_dc_price) * pip_multiplier
+                    if price_diff < 0
+                        total_green_pips += box_height_pips
+                        green_count += 1
+                    else
+                        total_red_pips += box_height_pips
+                        red_count += 1
+        
+        // TPをリセット
+        tp_hit := false
+        exit_price := na
+        exit_bar := na
+        exit_time := na
+        
+        // GC情報を更新
+        last_gc_price := entry_price
+        last_gc_bar := bar_index
+        last_gc_time := time
+        current_position := 1  // ロングポジション
+        
+        // 前のTPラインを削除
+        if not na(tp_line)
+            line.delete(tp_line)
+        if not na(tp_label)
+            label.delete(tp_label)
+        tp_line := na
+        tp_label := na
+        
+        // TP価格を計算（ロング）
+        if enable_tp
+            current_tp_price := entry_price + (tp_pips / pip_multiplier)
+            
+            // TPラインを描画
+            if show_tp_lines
+                tp_line := line.new(bar_index, current_tp_price, bar_index + 50, current_tp_price, 
+                                  color=color.green, style=line.style_dashed, width=1)
+            
+            // TPラベルを表示
+            if show_tp_labels
+                tp_label := label.new(bar_index + 5, current_tp_price, "TP: " + str.tostring(current_tp_price, "#.#####"), style=label.style_label_left, color=color.green, textcolor=color.white, size=size.small)
+
+// デッドクロス時の処理
+if dead_cross
+    entry_price = open
+    
+    // クロス時の正確な価格を計算
+    cross_price = get_cross_price(fast_ma[2], fast_ma[1], slow_ma[2], slow_ma[1])
+    
+    // 乖離を計算（DC時: クロス価格 - エントリー価格）
+    deviation_pips = (cross_price - entry_price) * pip_multiplier
+    
+    // エントリー見送り判定（DC時はマイナスの乖離をチェック）
+    skip_entry = enable_deviation_filter and deviation_pips > deviation_threshold
+    
+    if skip_entry
+        skip_dc_entry := true
+        // 見送りマーカーを表示
+        label.new(bar_index, high, "Skip\n-" + str.tostring(deviation_pips, "#.0") + "p", 
+                 style=label.style_label_down, color=color.orange, textcolor=color.white, size=size.tiny)
+        // 統計期間内なら見送り回数をカウント
+        if time >= stats_start_date and time <= stats_end_date
+            skip_count += 1
+    else
+        skip_dc_entry := false
+        
+        // 前のGCが存在する場合、GC→DCのボックスを描画
+        if not na(last_gc_price) and not na(last_gc_bar) and not skip_gc_entry
+            // 統計期間内かチェック
+            bool is_in_stats_period = last_gc_time >= stats_start_date and time <= stats_end_date
+            
+            // TPヒットした場合は、エントリーからTPまでのボックスを描画
+            if tp_hit
+                // TPヒット時は常にブルーパープル
+                box.new(last_gc_bar, math.max(last_gc_price, exit_price), exit_bar, math.min(last_gc_price, exit_price), 
+                       bgcolor=color.new(#6366F1, 85), border_color=color.new(#6366F1, 40), border_width=1)
+                
+                // 統計集計（パープル）
+                if is_in_stats_period and show_stats
+                    box_height_pips = math.abs(exit_price - last_gc_price) * pip_multiplier
+                    total_purple_pips += box_height_pips
+                    purple_count += 1
+            else
+                // 通常のクロス（TPヒットなし）の場合、現在の価格で計算
+                price_diff = entry_price - last_gc_price
+                // GC→DCの場合: プラスの差分ならブルー、マイナスの差分ならレッド
+                box_color = price_diff > 0 ? color.blue : color.red
+                
+                // ボックスを作成
+                box.new(last_gc_bar, math.max(last_gc_price, entry_price), bar_index, math.min(last_gc_price, entry_price), 
+                       bgcolor=color.new(box_color, 85), border_color=color.new(box_color, 40), border_width=1)
+                
+                // 統計集計（ブルーまたはレッド）
+                if is_in_stats_period and show_stats
+                    box_height_pips = math.abs(entry_price - last_gc_price) * pip_multiplier
+                    if price_diff > 0
+                        total_green_pips += box_height_pips
+                        green_count += 1
+                    else
+                        total_red_pips += box_height_pips
+                        red_count += 1
+        
+        // TPをリセット
+        tp_hit := false
+        exit_price := na
+        exit_bar := na
+        exit_time := na
+        
+        // DC情報を更新
+        last_dc_price := entry_price
+        last_dc_bar := bar_index
+        last_dc_time := time
+        current_position := -1  // ショートポジション
+        
+        // 前のTPラインを削除
+        if not na(tp_line)
+            line.delete(tp_line)
+        if not na(tp_label)
+            label.delete(tp_label)
+        tp_line := na
+        tp_label := na
+        
+        // TP価格を計算（ショート）
+        if enable_tp
+            current_tp_price := entry_price - (tp_pips / pip_multiplier)
+            
+            // TPラインを描画
+            if show_tp_lines
+                tp_line := line.new(bar_index, current_tp_price, bar_index + 50, current_tp_price, 
+                                  color=color.green, style=line.style_dashed, width=1)
+            
+            // TPラベルを表示
+            if show_tp_labels
+                tp_label := label.new(bar_index + 5, current_tp_price, "TP: " + str.tostring(current_tp_price, "#.#####"), style=label.style_label_left, color=color.green, textcolor=color.white, size=size.small)
+
+// TPラインを延長（現在のポジションがある場合）
+if current_position != 0 and not na(tp_line) and show_tp_lines
+    line.set_x2(tp_line, bar_index + 50)
+    if show_tp_labels and not na(tp_label)
+        label.set_x(tp_label, bar_index + 5)
+
+// 移動平均線の描画
+plot(show_ma_lines ? fast_ma : na, color=fast_color, title="短期移動平均", linewidth=2)
+plot(show_ma_lines ? slow_ma : na, color=slow_color, title="長期移動平均", linewidth=2)
+
+// クロスポイントのマーカー
+plotshape(golden_cross and not skip_gc_entry and show_cross_markers, style=shape.arrowup, location=location.belowbar, 
+          color=color.blue, size=size.small, title="ゴールデンクロス")
+plotshape(dead_cross and not skip_dc_entry and show_cross_markers, style=shape.arrowdown, location=location.abovebar, 
+          color=color.red, size=size.small, title="デッドクロス")
+
+// TPヒットマーカー
+plotshape(tp_hit[1], style=shape.xcross, location=location.absolute, color=#6366F1, size=size.small, title="TP Hit", text="TP")
+
+// 統計情報の表示
+if show_stats
+    var table stats_table = na
+    var string last_stats_position = ""
+    
+    // 位置が変更された場合、テーブルを削除して再作成
+    if na(stats_table) or stats_position != last_stats_position
+        if not na(stats_table)
+            table.delete(stats_table)
+        stats_table := table.new(get_table_position(stats_position), 2, 8, bgcolor=color.new(color.black, 80))
+        last_stats_position := stats_position
+    
+    // ヘッダー
+    table.cell(stats_table, 0, 0, "Statistics", text_color=color.white, bgcolor=color.new(color.gray, 20))
+    table.cell(stats_table, 1, 0, str.format("{0,date,yyyy-MM-dd} ~ {1,date,yyyy-MM-dd}", stats_start_date, stats_end_date), 
+               text_color=color.white, bgcolor=color.new(color.gray, 20))
+    
+    // グリーンボックス
+    table.cell(stats_table, 0, 1, "Blue (Profit)", text_color=color.blue)
+    table.cell(stats_table, 1, 1, str.tostring(total_green_pips, "#,###.0") + " pips (" + str.tostring(green_count) + " trades)", 
+               text_color=color.blue)
+    
+    // パープルボックス（TP到達）
+    table.cell(stats_table, 0, 2, "Purple (TP Hit)", text_color=#6366F1)
+    table.cell(stats_table, 1, 2, str.tostring(total_purple_pips, "#,###.0") + " pips (" + str.tostring(purple_count) + " trades)", 
+               text_color=#6366F1)
+    
+    // レッドボックス
+    table.cell(stats_table, 0, 3, "Red (Loss)", text_color=color.red)
+    table.cell(stats_table, 1, 3, str.tostring(total_red_pips, "#,###.0") + " pips (" + str.tostring(red_count) + " trades)", 
+               text_color=color.red)
+    
+    // 乖離フィルター（見送り）
+    table.cell(stats_table, 0, 4, "Deviation Filter (Skip)", text_color=color.orange)
+    table.cell(stats_table, 1, 4, str.tostring(skip_count) + " trades", text_color=color.orange)
+    
+    // 区切り線
+    table.cell(stats_table, 0, 5, "─────────", text_color=color.gray)
+    table.cell(stats_table, 1, 5, "─────────", text_color=color.gray)
+    
+    // 合計
+    net_pips = total_green_pips + total_purple_pips - total_red_pips
+    net_color = net_pips >= 0 ? color.green : color.red
+    table.cell(stats_table, 0, 6, "Net Profit", text_color=color.white)
+    table.cell(stats_table, 1, 6, (net_pips >= 0 ? "+" : "") + str.tostring(net_pips, "#,###.0") + " pips", 
+               text_color=net_color, text_size=size.large)
+    
+    // 勝率
+    total_trades = green_count + purple_count + red_count
+    win_trades = green_count + purple_count
+    win_rate = total_trades > 0 ? (win_trades / total_trades) * 100 : 0
+    table.cell(stats_table, 0, 7, "Win Rate", text_color=color.white)
+    table.cell(stats_table, 1, 7, str.tostring(win_rate, "#.0") + "% (" + str.tostring(win_trades) + "/" + str.tostring(total_trades) + ")", 
+               text_color=color.white)
+
+// デバッグ用の表示
+if show_debug
+    // デバッグ用のテーブル
+    var table debug_table = na
+    var string last_debug_position = ""
+    
+    // 位置が変更された場合、テーブルを削除して再作成
+    if na(debug_table) or debug_position != last_debug_position
+        if not na(debug_table)
+            table.delete(debug_table)
+        debug_table := table.new(get_table_position(debug_position), 2, 7, bgcolor=color.new(color.black, 80))
+        last_debug_position := debug_position
+    
+    table.cell(debug_table, 0, 0, "Item", text_color=color.white, bgcolor=color.new(color.gray, 20))
+    table.cell(debug_table, 1, 0, "Value", text_color=color.white, bgcolor=color.new(color.gray, 20))
+    
+    table.cell(debug_table, 0, 1, "Fast MA (9HMA)", text_color=color.white)
+    table.cell(debug_table, 1, 1, str.tostring(fast_ma, "#.####"), text_color=fast_color)
+    
+    table.cell(debug_table, 0, 2, "Slow MA (27SMA)", text_color=color.white)
+    table.cell(debug_table, 1, 2, str.tostring(slow_ma, "#.####"), text_color=slow_color)
+    
+    table.cell(debug_table, 0, 3, "GC Detection", text_color=color.white)
+    table.cell(debug_table, 1, 3, golden_cross ? "YES" : "NO", 
+               text_color=golden_cross ? color.green : color.gray)
+    
+    table.cell(debug_table, 0, 4, "DC Detection", text_color=color.white)
+    table.cell(debug_table, 1, 4, dead_cross ? "YES" : "NO", 
+               text_color=dead_cross ? color.red : color.gray)
+    
+    // 最新の乖離情報
+    latest_deviation = golden_cross ? (open - get_cross_price(fast_ma[2], fast_ma[1], slow_ma[2], slow_ma[1])) * pip_multiplier : 
+                      dead_cross ? (get_cross_price(fast_ma[2], fast_ma[1], slow_ma[2], slow_ma[1]) - open) * pip_multiplier : 
+                      na
+    
+    table.cell(debug_table, 0, 5, "Deviation (pips)", text_color=color.white)
+    table.cell(debug_table, 1, 5, na(latest_deviation) ? "N/A" : str.tostring(latest_deviation, "#.0"), 
+               text_color=na(latest_deviation) ? color.gray : latest_deviation > deviation_threshold ? color.orange : color.white)
+    
+    table.cell(debug_table, 0, 6, "Current Position", text_color=color.white)
+    table.cell(debug_table, 1, 6, current_position == 1 ? "Long" : current_position == -1 ? "Short" : "None", 
+               text_color=current_position == 1 ? color.green : current_position == -1 ? color.red : color.gray)
